@@ -6,6 +6,8 @@
   Purpose: Poll GPS position every 30s, check if inside polygon geofence,
            control 12V relay via GPIO, send/receive mesh messages to/from
            Home Assistant via the official Meshtastic HA integration.
+           Provides progressive audio beep warnings as user approaches the
+           geofence boundary.
 
   Message format received from HA (geofence_config):
     {
@@ -16,6 +18,10 @@
       "polygon": [[lat,lon], ...],
       "relay_gpio": 10,
       "enable_beeper": true,
+      "buzzer_gpio": 14,
+      "warn_dist_approaching": 50,
+      "warn_dist_near": 20,
+      "warn_dist_critical": 5,
       "version": 1
     }
 
@@ -25,6 +31,8 @@
       "status": "in_geofence",
       "latitude": 40.7128,
       "longitude": -74.0060,
+      "dist_to_boundary": 12.3,
+      "beep_zone": "NEAR",
       "relay_enabled": true,
       "battery_percent": 85,
       "gps_fix": true,
@@ -49,8 +57,16 @@ local CONFIG = {
     -- Override via geofence_config message or set here for static config.
     relay_gpio      = 10,
 
-    -- Buzzer/beeper support (SenseCAP X1 has built-in buzzer)
+    -- Buzzer/beeper support
+    -- enable_beeper: master switch for audio warnings
+    -- buzzer_gpio:   GPIO pin for external piezo (0 = use built-in buzzer API)
     enable_beeper   = false,
+    buzzer_gpio     = 0,
+
+    -- Distance thresholds for progressive beep warnings (metres)
+    warn_dist_approaching = 50,   -- slow beep zone (inside, 20–50m from edge)
+    warn_dist_near        = 20,   -- medium beep zone (inside, 5–20m from edge)
+    warn_dist_critical    = 5,    -- fast beep zone (inside, 0–5m from edge)
 
     -- Config version – used to detect stale configs
     version         = 0,
@@ -69,6 +85,13 @@ local STATE = {
     -- Geofence status
     inside_geofence = false,
 
+    -- Distance to nearest polygon edge in metres (positive = inside, negative = outside).
+    -- nil when no polygon configured or no GPS fix.
+    dist_to_boundary = nil,
+
+    -- Current beep zone: "SAFE", "APPROACHING", "NEAR", "CRITICAL", "OUTSIDE", or nil
+    beep_zone       = nil,
+
     -- Relay status
     relay_enabled   = false,
 
@@ -80,6 +103,9 @@ local STATE = {
 
     -- Status report interval in ticks (1 tick = ~30s → 10 ticks = 5 min)
     report_interval = 10,
+
+    -- Timestamp of last beep sequence (seconds, from os.time())
+    last_beep_time  = 0,
 }
 
 -- ---------------------------------------------------------------------------
@@ -91,6 +117,8 @@ local LOW_BATTERY_PCT    = 10      -- percent – relay OFF below this level
 local RELAY_ON           = 1       -- GPIO HIGH = relay energised
 local RELAY_OFF          = 0       -- GPIO LOW  = relay de-energised
 local EPSILON            = 1e-9
+local EARTH_RADIUS_M     = 6371000 -- mean Earth radius in metres
+local BEEP_MIN_INTERVAL  = 2       -- minimum seconds between beep sequences
 
 -- ---------------------------------------------------------------------------
 -- LOGGING HELPERS
@@ -135,32 +163,112 @@ local function relay_safe_off()
 end
 
 -- ---------------------------------------------------------------------------
--- BEEPER CONTROL  (SenseCAP X1 built-in buzzer)
+-- BEEPER CONTROL
 -- ---------------------------------------------------------------------------
+--
+-- Beep pattern library.  Each pattern is a sequence of {on_ms, off_ms}
+-- pairs to be played once per beeper_update invocation.
+--
+-- Patterns (from issue spec):
+--   STARTUP     : 3 × 50 ms on / 100 ms off  – device ready
+--   ERROR       : 3 × 200 ms on / 200 ms off – error occurred
+--   APPROACHING : 3 × 100 ms on / 200 ms off – 20–50 m from edge
+--   NEAR        : 4 × 75 ms on  / 150 ms off – 5–20 m from edge
+--   CRITICAL    : 5 × 50 ms on  / 100 ms off – 0–5 m from edge
+--   OUTSIDE     : 1 × 500 ms on / 500 ms off – OUTSIDE GEOFENCE
+--   LOW_BATTERY : 2 × 500 ms on / 500 ms off – battery critical
+--   SAFE        : (empty) – silent; safely inside and far from edge
+--
 
-local function beep(duration_ms)
-    if not CONFIG.enable_beeper then return end
-    local ok, err = pcall(function()
-        -- Meshtastic Lua: buzzer.beep(duration_ms)
-        buzzer.beep(duration_ms)
-    end)
-    if not ok then
-        log_debug("buzzer.beep not available: " .. tostring(err))
+local BEEP_PATTERNS = {
+    STARTUP     = { {50,100}, {50,100}, {50,100} },
+    ERROR       = { {200,200}, {200,200}, {200,200} },
+    APPROACHING = { {100,200}, {100,200}, {100,200} },
+    NEAR        = { {75,150}, {75,150}, {75,150}, {75,150} },
+    CRITICAL    = { {50,100}, {50,100}, {50,100}, {50,100}, {50,100} },
+    OUTSIDE     = { {500,500} },
+    LOW_BATTERY = { {500,500}, {500,500} },
+    SAFE        = {},
+}
+
+-- Busy-wait helper (Meshtastic Lua may not expose non-blocking sleep)
+local function busy_wait_ms(ms)
+    local t0 = os.time()
+    local target = ms / 1000
+    while os.time() - t0 < target do end
+end
+
+-- Drive a single beep pulse via GPIO (external piezo) or built-in buzzer API.
+local function beep_pulse(on_ms)
+    if CONFIG.buzzer_gpio ~= 0 then
+        -- GPIO-driven piezo buzzer
+        pcall(function()
+            gpio.write(CONFIG.buzzer_gpio, 1)
+            busy_wait_ms(on_ms)
+            gpio.write(CONFIG.buzzer_gpio, 0)
+        end)
+    else
+        -- Built-in buzzer API (SenseCAP X1 and compatible)
+        pcall(function()
+            buzzer.beep(on_ms)
+        end)
     end
 end
 
--- Single short confirmation beep
-local function beep_confirm()
-    beep(100)
+-- Play an entire beep pattern (blocking during the sequence).
+local function play_pattern(pattern)
+    if not CONFIG.enable_beeper then return end
+    for _, pulse in ipairs(pattern) do
+        local on_ms  = pulse[1]
+        local off_ms = pulse[2]
+        beep_pulse(on_ms)
+        if off_ms > 0 then
+            busy_wait_ms(off_ms)
+        end
+    end
 end
 
--- Double beep for geofence entry/exit events
-local function beep_event()
-    beep(200)
-    -- small pause then second beep
-    local t0 = os.time()
-    while os.time() - t0 < 1 do end
-    beep(200)
+-- Named helpers used from the lifecycle functions.
+local function play_startup()   play_pattern(BEEP_PATTERNS.STARTUP)   end
+local function play_error()     play_pattern(BEEP_PATTERNS.ERROR)     end
+local function play_low_batt()  play_pattern(BEEP_PATTERNS.LOW_BATTERY) end
+
+-- Determine the beep zone string from a signed distance value.
+--   dist_m > 0  : inside  (positive = metres to nearest edge from inside)
+--   dist_m <= 0 : outside (negative or zero)
+--   dist_m nil  : unknown (no GPS / no polygon)
+local function zone_from_dist(dist_m)
+    if dist_m == nil then return nil end
+    if dist_m < 0 then return "OUTSIDE" end
+    if dist_m <= CONFIG.warn_dist_critical    then return "CRITICAL"    end
+    if dist_m <= CONFIG.warn_dist_near        then return "NEAR"        end
+    if dist_m <= CONFIG.warn_dist_approaching then return "APPROACHING" end
+    return "SAFE"
+end
+
+-- Called each periodic tick to play the appropriate beep pattern once,
+-- respecting the minimum interval between sequences to prevent spam.
+local function beeper_update(dist_m)
+    local zone = zone_from_dist(dist_m)
+    STATE.beep_zone = zone
+
+    if not CONFIG.enable_beeper then return end
+    if zone == nil or zone == "SAFE" then return end
+
+    -- Enforce minimum interval between sequences
+    local now = os.time()
+    if (now - STATE.last_beep_time) < BEEP_MIN_INTERVAL then
+        log_debug("Beeper suppressed (min interval not elapsed)")
+        return
+    end
+
+    local pattern = BEEP_PATTERNS[zone]
+    if pattern and #pattern > 0 then
+        log_info("Beeper: playing pattern " .. zone ..
+                 " (dist=" .. (dist_m ~= nil and string.format("%.1f", dist_m) or "?") .. "m)")
+        play_pattern(pattern)
+        STATE.last_beep_time = os.time()
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -224,6 +332,81 @@ local function point_in_polygon(px, py, polygon)
 end
 
 -- ---------------------------------------------------------------------------
+-- DISTANCE TO POLYGON BOUNDARY
+-- ---------------------------------------------------------------------------
+--
+-- Converts a lat/lon offset to approximate metres using a flat-Earth
+-- (equirectangular) projection.  Accurate to ±5 m for distances < 1 km.
+--
+-- Returns the shortest distance in metres from point (px, py) to the line
+-- segment from (x1, y1) to (x2, y2), where all coordinates are in degrees.
+--
+local function deg_to_rad(d)
+    return d * math.pi / 180.0
+end
+
+local function point_to_segment_dist_m(px, py, x1, y1, x2, y2)
+    -- Convert lat/lon deltas to approximate metres.
+    -- Use the midpoint latitude for the longitude-to-metres scale factor.
+    local mid_lat = (x1 + x2) / 2.0
+    local cos_lat = math.cos(deg_to_rad(mid_lat))
+    local m_per_deg_lat = EARTH_RADIUS_M * math.pi / 180.0
+    local m_per_deg_lon = m_per_deg_lat * cos_lat
+
+    -- Project everything into a local (x_m, y_m) plane relative to (x1, y1)
+    local ax = (x2 - x1) * m_per_deg_lat
+    local ay = (y2 - y1) * m_per_deg_lon
+    local bx = (px - x1) * m_per_deg_lat
+    local by = (py - y1) * m_per_deg_lon
+
+    local seg_len_sq = ax * ax + ay * ay
+
+    local dist_m
+    if seg_len_sq < EPSILON then
+        -- Degenerate segment (zero length): distance to endpoint
+        dist_m = math.sqrt(bx * bx + by * by)
+    else
+        -- Project b onto the segment, clamp to [0,1]
+        local t = (bx * ax + by * ay) / seg_len_sq
+        if t < 0.0 then t = 0.0 end
+        if t > 1.0 then t = 1.0 end
+        local dx = bx - t * ax
+        local dy = by - t * ay
+        dist_m = math.sqrt(dx * dx + dy * dy)
+    end
+
+    return dist_m
+end
+
+-- Returns a signed distance in metres from (px, py) to the nearest polygon edge:
+--   positive  → inside geofence   (distance to the closest edge)
+--   negative  → outside geofence  (negated distance to the closest edge)
+--   nil       → polygon has fewer than 3 vertices
+--
+local function dist_to_boundary_m(px, py, polygon)
+    local n = #polygon
+    if n < 3 then return nil end
+
+    local min_dist = math.huge
+    local j = n
+    for i = 1, n do
+        local d = point_to_segment_dist_m(
+            px, py,
+            polygon[i][1], polygon[i][2],
+            polygon[j][1], polygon[j][2]
+        )
+        if d < min_dist then
+            min_dist = d
+        end
+        j = i
+    end
+
+    -- Sign: positive if inside, negative if outside
+    local inside = point_in_polygon(px, py, polygon)
+    return inside and min_dist or -min_dist
+end
+
+-- ---------------------------------------------------------------------------
 -- GPS POLLING
 -- ---------------------------------------------------------------------------
 
@@ -284,6 +467,8 @@ local function evaluate_geofence()
         if STATE.relay_enabled then
             relay_safe_off()
         end
+        STATE.dist_to_boundary = nil
+        STATE.beep_zone = nil
         return
     end
 
@@ -293,34 +478,52 @@ local function evaluate_geofence()
         if STATE.relay_enabled then
             relay_safe_off()
         end
+        STATE.dist_to_boundary = nil
+        STATE.beep_zone = nil
         return
     end
 
-    -- Low battery or unknown battery state → disable relay (safe state)
+    -- Low battery → disable relay (safe state) and warn
     if STATE.battery_percent < LOW_BATTERY_PCT then
         log_warn("Low battery (" .. STATE.battery_percent .. "%) – relay OFF (safe)")
         if STATE.relay_enabled then
             relay_safe_off()
         end
+        -- Play low-battery beep pattern (subject to spam guard)
+        local now = os.time()
+        if (now - STATE.last_beep_time) >= BEEP_MIN_INTERVAL then
+            play_low_batt()
+            STATE.last_beep_time = os.time()
+        end
+        STATE.beep_zone = nil
         return
     end
 
-    -- Run point-in-polygon check
-    local inside = point_in_polygon(STATE.latitude, STATE.longitude, CONFIG.polygon)
+    -- Calculate signed distance to boundary
+    local dist_m = dist_to_boundary_m(STATE.latitude, STATE.longitude, CONFIG.polygon)
+    STATE.dist_to_boundary = dist_m
 
-    -- Detect state change for beep event
+    -- Derive inside/outside from sign of distance
+    local inside = (dist_m ~= nil) and (dist_m > 0)
+
+    -- Detect state change for logging
     local changed = (inside ~= STATE.inside_geofence)
     STATE.inside_geofence = inside
 
     if changed then
         log_info("Geofence status CHANGED → " .. (inside and "INSIDE" or "OUTSIDE"))
-        beep_event()
     end
+
+    log_debug(string.format("dist_to_boundary=%.1fm  inside=%s",
+        dist_m ~= nil and dist_m or 0, tostring(inside)))
 
     -- Relay logic: ON when inside geofence, OFF when outside
     if inside ~= STATE.relay_enabled then
         relay_set(inside)
     end
+
+    -- Progressive audio warning
+    beeper_update(dist_m)
 end
 
 -- ---------------------------------------------------------------------------
@@ -330,14 +533,27 @@ end
 local function send_status()
     local status_str = STATE.inside_geofence and "in_geofence" or "outside_geofence"
 
+    -- Format optional distance field (omit when unknown)
+    local dist_field = ""
+    if STATE.dist_to_boundary ~= nil then
+        dist_field = string.format(',"dist_to_boundary":%.1f', STATE.dist_to_boundary)
+    end
+
+    local zone_field = ""
+    if STATE.beep_zone ~= nil then
+        zone_field = string.format(',"beep_zone":"%s"', STATE.beep_zone)
+    end
+
     -- Build JSON manually (no json library guaranteed in Meshtastic Lua)
     local msg = string.format(
-        '{"device":"Tracker-%s","status":"%s","latitude":%.6f,"longitude":%.6f,' ..
-        '"relay_enabled":%s,"battery_percent":%d,"gps_fix":%s,"timestamp":%d}',
+        '{"device":"Tracker-%s","status":"%s","latitude":%.6f,"longitude":%.6f' ..
+        '%s%s,"relay_enabled":%s,"battery_percent":%d,"gps_fix":%s,"timestamp":%d}',
         CONFIG.tracker_id,
         status_str,
         STATE.latitude,
         STATE.longitude,
+        dist_field,
+        zone_field,
         STATE.relay_enabled and "true" or "false",
         STATE.battery_percent,
         STATE.gps_fix and "true" or "false",
@@ -456,18 +672,30 @@ local function handle_geofence_config(payload)
     if enable_beeper ~= nil then
         CONFIG.enable_beeper = enable_beeper
     end
+    CONFIG.buzzer_gpio    = json_num(payload, "buzzer_gpio")     or CONFIG.buzzer_gpio
+    CONFIG.warn_dist_approaching = json_num(payload, "warn_dist_approaching") or CONFIG.warn_dist_approaching
+    CONFIG.warn_dist_near        = json_num(payload, "warn_dist_near")        or CONFIG.warn_dist_near
+    CONFIG.warn_dist_critical    = json_num(payload, "warn_dist_critical")    or CONFIG.warn_dist_critical
     CONFIG.version        = new_version or (CONFIG.version + 1)
 
     log_info(string.format(
-        "Config applied: person=%s, geofence=%s, vertices=%d, gpio=%d, beeper=%s",
+        "Config applied: person=%s, geofence=%s, vertices=%d, gpio=%d, beeper=%s, buzzer_gpio=%d",
         CONFIG.person_name,
         CONFIG.geofence_name,
         #CONFIG.polygon,
         CONFIG.relay_gpio,
-        tostring(CONFIG.enable_beeper)
+        tostring(CONFIG.enable_beeper),
+        CONFIG.buzzer_gpio
+    ))
+    log_info(string.format(
+        "Beep thresholds: approaching=%dm, near=%dm, critical=%dm",
+        CONFIG.warn_dist_approaching,
+        CONFIG.warn_dist_near,
+        CONFIG.warn_dist_critical
     ))
 
-    beep_confirm()
+    -- Confirm config receipt with startup pattern
+    play_startup()
 
     -- Immediately re-evaluate with new polygon
     evaluate_geofence()
@@ -536,6 +764,9 @@ function onStart()
 
     -- Initial battery read
     update_battery()
+
+    -- Startup beep: 3 short beeps = device ready
+    play_startup()
 
     log_info("onStart complete – polling every " .. (POLL_INTERVAL_MS / 1000) .. "s")
 
