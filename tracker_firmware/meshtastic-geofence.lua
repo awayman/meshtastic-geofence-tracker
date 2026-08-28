@@ -193,9 +193,9 @@ local BEEP_PATTERNS = {
 
 -- Busy-wait helper (Meshtastic Lua may not expose non-blocking sleep)
 local function busy_wait_ms(ms)
-    local t0 = os.time()
+    local t0 = os.clock()
     local target = ms / 1000
-    while os.time() - t0 < target do end
+    while os.clock() - t0 < target do end
 end
 
 -- Drive a single beep pulse via GPIO (external piezo) or built-in buzzer API.
@@ -239,7 +239,7 @@ local function play_low_batt()  play_pattern(BEEP_PATTERNS.LOW_BATTERY) end
 --   dist_m nil  : unknown (no GPS / no polygon)
 local function zone_from_dist(dist_m)
     if dist_m == nil then return nil end
-    if dist_m < 0 then return "OUTSIDE" end
+    if dist_m <= 0 then return "OUTSIDE" end
     if dist_m <= CONFIG.warn_dist_critical    then return "CRITICAL"    end
     if dist_m <= CONFIG.warn_dist_near        then return "NEAR"        end
     if dist_m <= CONFIG.warn_dist_approaching then return "APPROACHING" end
@@ -496,6 +496,7 @@ local function evaluate_geofence()
             STATE.last_beep_time = os.time()
         end
         STATE.beep_zone = nil
+        STATE.dist_to_boundary = nil
         return
     end
 
@@ -514,8 +515,11 @@ local function evaluate_geofence()
         log_info("Geofence status CHANGED → " .. (inside and "INSIDE" or "OUTSIDE"))
     end
 
-    log_debug(string.format("dist_to_boundary=%.1fm  inside=%s",
-        dist_m ~= nil and dist_m or 0, tostring(inside)))
+    if dist_m ~= nil then
+        log_debug(string.format("dist_to_boundary=%.1fm  inside=%s", dist_m, tostring(inside)))
+    else
+        log_debug("dist_to_boundary=nil  inside=" .. tostring(inside))
+    end
 
     -- Relay logic: ON when inside geofence, OFF when outside
     if inside ~= STATE.relay_enabled then

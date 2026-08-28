@@ -378,8 +378,7 @@ class TestDistToBoundary(unittest.TestCase):
     def test_zero_length_segment(self):
         # Zero-length segment: distance equals distance to the endpoint
         d = point_to_segment_dist_m(0.001, 0.001, 0.0, 0.0, 0.0, 0.0)
-        expected = point_to_segment_dist_m(0.001, 0.001, 0.0, 0.0, 0.001, 0.001)
-        # Both should be finite positive numbers
+        # Should be finite positive numbers
         self.assertGreater(d, 0.0)
         self.assertLess(d, 1000.0)
 
@@ -392,7 +391,7 @@ class TestDistToBoundary(unittest.TestCase):
         """Python mirror of Lua zone_from_dist."""
         if dist_m is None:
             return None
-        if dist_m < 0:
+        if dist_m <= 0:
             return "OUTSIDE"
         if dist_m <= critical:
             return "CRITICAL"
@@ -415,9 +414,10 @@ class TestDistToBoundary(unittest.TestCase):
 
     def test_zone_critical(self):
         self.assertEqual(self.zone_from_dist(5.0), "CRITICAL")
-        self.assertEqual(self.zone_from_dist(0.0), "CRITICAL")
+        self.assertEqual(self.zone_from_dist(0.1), "CRITICAL")
 
     def test_zone_outside(self):
+        self.assertEqual(self.zone_from_dist(0.0), "OUTSIDE")
         self.assertEqual(self.zone_from_dist(-1.0), "OUTSIDE")
         self.assertEqual(self.zone_from_dist(-100.0), "OUTSIDE")
 
