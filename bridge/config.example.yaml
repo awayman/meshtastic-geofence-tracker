@@ -1,0 +1,27 @@
+# Meshtastic MQTT Bridge — Example Configuration
+# Copy this file to config.yaml and fill in your values.
+
+mqtt:
+  host: "localhost"        # MQTT broker hostname or IP
+  port: 1883               # MQTT broker port (default 1883; use 8883 for TLS)
+  client_id: "meshtastic_bridge"
+  username: ""             # Leave blank if no auth required
+  password: ""
+
+  # Optional TLS settings
+  tls:
+    enabled: false
+    ca_certs: ""           # Path to CA certificate file
+    certfile: ""           # Path to client certificate (optional)
+    keyfile: ""            # Path to client private key (optional)
+
+meshtastic:
+  # "serial" for USB-connected device, "tcp" for network-connected device
+  connection_type: "serial"
+
+  # Serial connection settings (used when connection_type = "serial")
+  port: "/dev/ttyUSB0"     # Serial port; e.g. /dev/ttyACM0 on Linux, COM3 on Windows
+
+  # TCP connection settings (used when connection_type = "tcp")
+  # host: "192.168.1.100"
+  # port: 4403

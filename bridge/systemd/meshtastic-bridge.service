@@ -1,0 +1,24 @@
+[Unit]
+Description=Meshtastic MQTT Bridge
+Documentation=https://github.com/awayman/meshtastic-geofence-tracker
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=meshtastic
+Group=meshtastic
+WorkingDirectory=/opt/meshtastic-bridge
+ExecStart=/opt/meshtastic-bridge/venv/bin/python meshtastic_bridge.py --config /opt/meshtastic-bridge/config.yaml
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meshtastic-bridge
+
+# Environment overrides (optional)
+# Environment=LOG_LEVEL=DEBUG
+# Environment=BRIDGE_CONFIG=/opt/meshtastic-bridge/config.yaml
+
+[Install]
+WantedBy=multi-user.target

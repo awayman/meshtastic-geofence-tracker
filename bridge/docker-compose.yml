@@ -1,0 +1,15 @@
+version: "3.8"
+
+services:
+  meshtastic-bridge:
+    build: .
+    container_name: meshtastic-bridge
+    restart: unless-stopped
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+    environment:
+      - LOG_LEVEL=INFO
+    # Uncomment and adjust for USB-connected Meshtastic device:
+    # devices:
+    #   - /dev/ttyUSB0:/dev/ttyUSB0
+    # For TCP-connected device, no device mapping is needed.
