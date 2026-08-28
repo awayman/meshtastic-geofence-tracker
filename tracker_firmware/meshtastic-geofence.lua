@@ -90,6 +90,7 @@ local POLL_INTERVAL_MS   = 30000   -- 30 seconds
 local LOW_BATTERY_PCT    = 10      -- percent – relay OFF below this level
 local RELAY_ON           = 1       -- GPIO HIGH = relay energised
 local RELAY_OFF          = 0       -- GPIO LOW  = relay de-energised
+local EPSILON            = 1e-9
 
 -- ---------------------------------------------------------------------------
 -- LOGGING HELPERS
@@ -177,6 +178,16 @@ end
 --   • Point exactly on an edge → treated as outside (conservative / safe).
 --
 
+local function point_on_segment(px, py, xi, yi, xj, yj)
+    local cross = (px - xi) * (yj - yi) - (py - yi) * (xj - xi)
+    if math.abs(cross) > EPSILON then
+        return false
+    end
+
+    local dot = (px - xi) * (px - xj) + (py - yi) * (py - yj)
+    return dot <= EPSILON
+end
+
 local function point_in_polygon(px, py, polygon)
     local n = #polygon
     if n < 3 then
@@ -192,6 +203,10 @@ local function point_in_polygon(px, py, polygon)
         local yi = polygon[i][2]
         local xj = polygon[j][1]
         local yj = polygon[j][2]
+
+        if point_on_segment(px, py, xi, yi, xj, yj) then
+            return false
+        end
 
         -- Check if the ray from (px, py) heading right crosses edge (j→i)
         local crosses = (
@@ -281,8 +296,8 @@ local function evaluate_geofence()
         return
     end
 
-    -- Low battery → disable relay (safe state)
-    if STATE.battery_percent > 0 and STATE.battery_percent < LOW_BATTERY_PCT then
+    -- Low battery or unknown battery state → disable relay (safe state)
+    if STATE.battery_percent < LOW_BATTERY_PCT then
         log_warn("Low battery (" .. STATE.battery_percent .. "%) – relay OFF (safe)")
         if STATE.relay_enabled then
             relay_safe_off()
@@ -359,7 +374,7 @@ end
 
   Limitations:
     - Keys/values must not contain escaped quotes
-    - Polygon values must be plain numbers (no whitespace inside brackets)
+    - Polygon values must be plain numbers
 ]]
 
 local function json_str(text, key)
@@ -374,12 +389,15 @@ end
 
 local function json_bool(text, key)
     local val = text:match('"' .. key .. '"%s*:%s*(true|false)')
+    if val == nil then
+        return nil
+    end
     return val == "true"
 end
 
 local function json_polygon(text)
     -- Extract the polygon array string: [[...],[...],...]
-    local arr_str = text:match('"polygon"%s*:%s*(%[%[.-%]%])')
+    local arr_str = text:match('"polygon"%s*:%s*(%b[])')
     if not arr_str then
         return nil
     end
@@ -434,7 +452,10 @@ local function handle_geofence_config(payload)
     CONFIG.geofence_name  = json_str(payload, "geofence_name")  or CONFIG.geofence_name
     CONFIG.polygon        = polygon
     CONFIG.relay_gpio     = json_num(payload, "relay_gpio")      or CONFIG.relay_gpio
-    CONFIG.enable_beeper  = json_bool(payload, "enable_beeper")
+    local enable_beeper = json_bool(payload, "enable_beeper")
+    if enable_beeper ~= nil then
+        CONFIG.enable_beeper = enable_beeper
+    end
     CONFIG.version        = new_version or (CONFIG.version + 1)
 
     log_info(string.format(
@@ -457,23 +478,30 @@ end
 -- ---------------------------------------------------------------------------
 
 local function on_receive_message(packet)
-    if not packet then return end
+    local ok, err = pcall(function()
+        if not packet then return end
 
-    -- Only handle text messages (portnum 1 = TEXT_MESSAGE_APP)
-    local portnum = packet.decoded and packet.decoded.portnum
-    if portnum ~= 1 then return end
+        -- Only handle text messages (portnum 1 = TEXT_MESSAGE_APP)
+        local portnum = packet.decoded and packet.decoded.portnum
+        if portnum ~= 1 then return end
 
-    local payload = packet.decoded and packet.decoded.text
-    if not payload or payload == "" then return end
+        local payload = packet.decoded and packet.decoded.text
+        if not payload or payload == "" then return end
 
-    log_debug("Received mesh message: " .. payload)
+        log_debug("Received mesh message: " .. payload)
 
-    -- Dispatch on message type field
-    local msg_type = json_str(payload, "type")
-    if msg_type == "geofence_config" then
-        handle_geofence_config(payload)
-    else
-        log_debug("Unhandled message type: " .. tostring(msg_type))
+        -- Dispatch on message type field
+        local msg_type = json_str(payload, "type")
+        if msg_type == "geofence_config" then
+            handle_geofence_config(payload)
+        else
+            log_debug("Unhandled message type: " .. tostring(msg_type))
+        end
+    end)
+
+    if not ok then
+        log_err("onReceive error: " .. tostring(err))
+        pcall(relay_safe_off)
     end
 end
 

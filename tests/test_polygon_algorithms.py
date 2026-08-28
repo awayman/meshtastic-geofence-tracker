@@ -21,6 +21,18 @@ import unittest
 # Python mirror of the Lua point_in_polygon function
 # ---------------------------------------------------------------------------
 
+EPSILON = 1e-9
+
+
+def point_on_segment(px: float, py: float, xi: float, yi: float, xj: float, yj: float) -> bool:
+    cross = (px - xi) * (yj - yi) - (py - yi) * (xj - xi)
+    if abs(cross) > EPSILON:
+        return False
+
+    dot = (px - xi) * (px - xj) + (py - yi) * (py - yj)
+    return dot <= EPSILON
+
+
 def point_in_polygon(px: float, py: float, polygon: list) -> bool:
     """
     Ray-casting point-in-polygon test.
@@ -43,6 +55,9 @@ def point_in_polygon(px: float, py: float, polygon: list) -> bool:
     for i in range(n):
         xi, yi = polygon[i]
         xj, yj = polygon[j]
+
+        if point_on_segment(px, py, xi, yi, xj, yj):
+            return False
 
         crosses = ((yi > py) != (yj > py)) and \
                   (px < (xj - xi) * (py - yi) / (yj - yi) + xi)
@@ -79,6 +94,12 @@ class TestPointInPolygon(unittest.TestCase):
 
     def test_rect_near_edge_inside(self):
         self.assertTrue(point_in_polygon(1.99, 1.99, self.RECT))
+
+    def test_rect_point_on_edge_outside(self):
+        self.assertFalse(point_in_polygon(1.0, 0.0, self.RECT))
+
+    def test_rect_point_on_vertex_outside(self):
+        self.assertFalse(point_in_polygon(0.0, 0.0, self.RECT))
 
     def test_rect_outside_right(self):
         self.assertFalse(point_in_polygon(1.0, 3.0, self.RECT))
@@ -229,14 +250,31 @@ def lua_json_num(text, key):
 
 def lua_json_bool(text, key):
     m = re.search(r'"' + re.escape(key) + r'"\s*:\s*(true|false)', text)
-    return m.group(1) == "true" if m else False
+    return (m.group(1) == "true") if m else None
 
 
 def lua_json_polygon(text):
-    m = re.search(r'"polygon"\s*:\s*(\[\[.*?\]\])', text, re.DOTALL)
-    if not m:
+    m = re.search(r'"polygon"\s*:\s*', text)
+    if not m or m.end() >= len(text) or text[m.end()] != "[":
         return None
-    arr_str = m.group(1)
+
+    start = m.end()
+    depth = 0
+    end = None
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                end = idx
+                break
+
+    if end is None:
+        return None
+
+    arr_str = text[start:end + 1]
     verts = re.findall(r'\[\s*(-?\d+\.?\d*)\s*,\s*(-?\d+\.?\d*)\s*\]', arr_str)
     polygon = [[float(lat), float(lon)] for lat, lon in verts]
     return polygon if len(polygon) >= 3 else None
@@ -274,6 +312,10 @@ class TestJsonParsing(unittest.TestCase):
         msg = SAMPLE_CONFIG.replace('"enable_beeper":true', '"enable_beeper":false')
         self.assertFalse(lua_json_bool(msg, "enable_beeper"))
 
+    def test_parse_enable_beeper_missing(self):
+        msg = SAMPLE_CONFIG.replace('"enable_beeper":true,', "")
+        self.assertIsNone(lua_json_bool(msg, "enable_beeper"))
+
     def test_parse_version(self):
         self.assertEqual(lua_json_num(SAMPLE_CONFIG, "version"), 1.0)
 
@@ -299,6 +341,18 @@ class TestJsonParsing(unittest.TestCase):
     def test_missing_polygon_key(self):
         bad_msg = '{"type":"geofence_config","relay_gpio":10}'
         self.assertIsNone(lua_json_polygon(bad_msg))
+
+    def test_parse_polygon_with_whitespace(self):
+        msg = (
+            '{\n'
+            '  "type": "geofence_config",\n'
+            '  "polygon": [ [40.7128, -74.0060], [40.7135, -74.0060],\n'
+            '               [40.7135, -74.0055], [40.7128, -74.0055] ]\n'
+            '}'
+        )
+        poly = lua_json_polygon(msg)
+        self.assertIsNotNone(poly)
+        self.assertEqual(len(poly), 4)
 
 
 if __name__ == "__main__":

@@ -66,6 +66,6 @@ CONFIG = {
   T-Beam v1.1      | 4  (check schematics)
   WiseMesh B1      | 12 (check schematics)
 
-  All relay outputs are active-HIGH (GPIO HIGH = relay energised = toy ON).
+  All relay outputs are active-HIGH (GPIO HIGH = relay energised = relay ON).
   A flyback diode on the relay coil is strongly recommended.
 ]]
